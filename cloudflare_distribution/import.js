@@ -19,7 +19,87 @@ const rateLimiter = pRateLimit({
   rate: 60, // 60 calls per interval
 });
 
-const rateLimitedRequest = (query, variables) => rateLimiter(() => request(endpoint, query, variables));
+// Set from the command line in main()
+const retryConfig = { delaySeconds: 5, maxRetries: 6 };
+const MAX_BACKOFF_MS = 10 * 60 * 1000;
+const MAX_RETRY_AFTER_MS = 60 * 60 * 1000;
+const NETWORK_ERROR_CODES = ['ECONNRESET', 'ETIMEDOUT', 'ENOTFOUND', 'EAI_AGAIN', 'ECONNREFUSED', 'EPIPE'];
+
+// Network errors from fetch include the request URL, which contains the personal token
+const redact = (text) =>
+  String(text)
+    .replace(/personalToken=[^&\s"')]+/g, 'personalToken=***')
+    .replace(/(\/graphql\/)[A-Za-z0-9_-]{16,}/g, '$1***');
+
+const errorMessage = (err) => redact(err?.response?.errors?.[0]?.message || err?.message || err);
+
+const isRateLimitError = (err) =>
+  err?.response?.status === 429 ||
+  Boolean(
+    err?.response?.errors?.some(
+      (e) => e.extensions?.code === 'RateLimitExceeded' || /rate limit|too many requests/i.test(e.message),
+    ),
+  );
+
+// The request never got an HTTP/GraphQL response back
+const isNetworkError = (err) =>
+  !err?.response &&
+  (NETWORK_ERROR_CODES.includes(err?.code) ||
+    NETWORK_ERROR_CODES.includes(err?.cause?.code) ||
+    /fetch failed|socket hang up|network|timed? ?out/i.test(err?.message || ''));
+
+// Retry-After is either a number of seconds or an HTTP date
+const retryAfterMs = (err) => {
+  const headers = err?.response?.headers;
+  const value = headers?.get ? headers.get('retry-after') : headers?.['retry-after'];
+  if (value === undefined || value === null || value === '') {
+    return null;
+  }
+  const seconds = Number(value);
+  const ms = Number.isFinite(seconds) ? seconds * 1000 : new Date(value).getTime() - Date.now();
+  return Number.isFinite(ms) ? Math.min(Math.max(ms, 0), MAX_RETRY_AFTER_MS) : null;
+};
+
+/**
+ * Sends a request, waiting and retrying when the API rate limits us (429, RateLimitExceeded) or the network fails.
+ * The wait is the Retry-After of the response when there is one, otherwise it doubles on each retry of the same call.
+ * Anything else is thrown right away. A rate limited mutation is rejected before it does anything, so it is safe to
+ * send again. After a network error a mutation may still have been applied, so `didItApply(since)` (a read that returns
+ * the result of the mutation if it exists) is checked before sending it again.
+ */
+async function rateLimitedRequest(query, variables, { didItApply } = {}) {
+  const startedAt = new Date(Date.now() - 30 * 1000).toISOString();
+  for (let retry = 0; ; ) {
+    try {
+      return await rateLimiter(() => request(endpoint, query, variables));
+    } catch (err) {
+      const rateLimited = isRateLimitError(err);
+      const network = !rateLimited && isNetworkError(err);
+      if (!rateLimited && !network) {
+        throw err;
+      }
+      err.isRateLimit = rateLimited;
+      err.isNetwork = network;
+      if (retry >= retryConfig.maxRetries) {
+        throw err;
+      }
+      retry++;
+      const waitMs = retryAfterMs(err) ?? Math.min(retryConfig.delaySeconds * 1000 * 2 ** (retry - 1), MAX_BACKOFF_MS);
+      const reason = rateLimited ? 'Rate limited' : `Network error (${err.code || err.cause?.code || 'no response'})`;
+      console.log(
+        `  ${reason}, waiting ${Math.round(waitMs / 100) / 10}s before retry ${retry}/${retryConfig.maxRetries}...`,
+      );
+      await sleep(waitMs);
+      if (network && didItApply) {
+        const applied = await didItApply(startedAt);
+        if (applied) {
+          console.log('  The request had gone through before the network error, not sending it again.');
+          return applied;
+        }
+      }
+    }
+  }
+}
 
 // Expenses in these states still represent money that is (or will be) on its way to the recipient
 const OPEN_EXPENSE_STATUSES = [
@@ -177,6 +257,37 @@ const fundRefundsQuery = gql`
           }
           expense {
             legacyId
+          }
+        }
+      }
+    }
+  }
+`;
+
+const recentExpensesQuery = gql`
+  query RecentExpenses($slug: String!) {
+    expenses(account: { slug: $slug }, limit: 20, orderBy: { field: CREATED_AT, direction: DESC }) {
+      nodes {
+        legacyId
+        status
+        createdAt
+        customData
+      }
+    }
+  }
+`;
+
+const recentOrdersQuery = gql`
+  query RecentOrders($slug: String!) {
+    account(slug: $slug) {
+      orders(filter: OUTGOING, limit: 20, orderBy: { field: CREATED_AT, direction: DESC }) {
+        nodes {
+          legacyId
+          status
+          createdAt
+          frequency
+          toAccount {
+            slug
           }
         }
       }
@@ -443,8 +554,11 @@ async function checkPrevious(ref, existing, ledgerEntry) {
       }
     }
   } catch (err) {
+    if (err.isRateLimit || err.isNetwork) {
+      throw err;
+    }
     if (!isNotFound(err)) {
-      return { failed: false, error: err.response?.errors?.[0]?.message || err.message };
+      return { failed: false, error: errorMessage(err) };
     }
     status = 'DELETED';
   }
@@ -489,6 +603,9 @@ async function classify(record, index, { fundHostId, existing, ledger, sharedSlu
     try {
       account = await lookupAccount(slug);
     } catch (err) {
+      if (err.isRateLimit || err.isNetwork) {
+        throw err;
+      }
       lookupFailed = true;
     }
   }
@@ -658,22 +775,44 @@ const buildInviteExpense = (row, fund, { recipientNotes, description }) => {
 
 async function execute(row, { fund, fundSlug, paymentMethodId, inviteOptions }) {
   if (row.bucket === 'ready') {
-    const { createOrder } = await rateLimitedRequest(createOrderMutation, {
-      order: {
-        fromAccount: { slug: fundSlug },
-        toAccount: { slug: row.slug },
-        amount: { valueInCents: row.amountInCents, currency: fund.currency },
-        frequency: row.frequency,
-        paymentMethod: { id: paymentMethodId },
+    const { createOrder } = await rateLimitedRequest(
+      createOrderMutation,
+      {
+        order: {
+          fromAccount: { slug: fundSlug },
+          toAccount: { slug: row.slug },
+          amount: { valueInCents: row.amountInCents, currency: fund.currency },
+          frequency: row.frequency,
+          paymentMethod: { id: paymentMethodId },
+        },
       },
-    });
+      {
+        didItApply: async (since) => {
+          const data = await rateLimitedRequest(recentOrdersQuery, { slug: fundSlug });
+          const found = data.account.orders.nodes.find(
+            (o) => o.toAccount.slug === row.slug && o.frequency === row.frequency && o.createdAt >= since,
+          );
+          return found && { createOrder: { order: { legacyId: found.legacyId, status: found.status } } };
+        },
+      },
+    );
     return `order #${createOrder.order.legacyId} (${createOrder.order.status})`;
   } else {
-    const result = await rateLimitedRequest(inviteMutation, {
-      account: { slug: fundSlug },
-      expense: buildInviteExpense(row, fund, inviteOptions),
-      lockedFields: ['AMOUNT', 'DESCRIPTION'],
-    });
+    const result = await rateLimitedRequest(
+      inviteMutation,
+      {
+        account: { slug: fundSlug },
+        expense: buildInviteExpense(row, fund, inviteOptions),
+        lockedFields: ['AMOUNT', 'DESCRIPTION'],
+      },
+      {
+        didItApply: async (since) => {
+          const data = await rateLimitedRequest(recentExpensesQuery, { slug: fundSlug });
+          const found = data.expenses.nodes.find((e) => e.customData?.viteFundKey === row.key && e.createdAt >= since);
+          return found && { draftExpenseAndInviteUser: { legacyId: found.legacyId, status: found.status } };
+        },
+      },
+    );
     return `expense #${result.draftExpenseAndInviteUser.legacyId} (${result.draftExpenseAndInviteUser.status})`;
   }
 }
@@ -698,6 +837,8 @@ const printSummary = (rows, fund) => {
 async function main(argv = process.argv) {
   const program = getProgram(argv);
   const options = program.opts();
+  retryConfig.delaySeconds = Number(options.retryDelay);
+  retryConfig.maxRetries = Number(options.maxRetries);
   const [inputFilename] = program.args;
   const ledgerPath = path.resolve(options.ledger);
 
@@ -809,11 +950,10 @@ async function main(argv = process.argv) {
         saveLedger(ledgerPath, ledger);
         console.log(`${row.id}: ${row.bucket} -> ${result}`);
       } catch (err) {
-        const message = err.response?.errors?.[0]?.message || err.message;
-        console.error(`${row.id}: FAILED (${row.bucket}): ${message}`);
-        if (/rate limit/i.test(message)) {
+        console.error(`${row.id}: FAILED (${row.bucket}): ${errorMessage(err)}`);
+        if (err.isRateLimit || err.isNetwork) {
           console.error(
-            'Hit the API rate limit, stopping. Completed rows are saved, rerun later (or with a higher --delay).',
+            `Still ${err.isRateLimit ? 'rate limited' : 'getting network errors'} after ${retryConfig.maxRetries} retries, stopping. Completed rows are saved, rerun later (or with a higher --retry-delay).`,
           );
           return;
         }
@@ -846,6 +986,12 @@ const getProgram = (argv) => {
     'Write a copy of the CSV with links to the contributions/expenses in the Status column.',
   );
   program.option('--delay <seconds>', 'Seconds to wait after each invite expense.', '20');
+  program.option(
+    '--retry-delay <seconds>',
+    'First wait after a rate limit or network error, doubled on each retry (a Retry-After header wins).',
+    '5',
+  );
+  program.option('--max-retries <n>', 'Retries for one call after rate limit or network errors before stopping.', '6');
   program.option('--description <description>', 'Description for invite expenses.', 'Vite Ecosystem Fund contribution');
 
   program.parse(argv);
@@ -858,7 +1004,7 @@ if (!module.parent) {
     .then(() => process.exit())
     .catch((e) => {
       if (e.name !== 'CommanderError') {
-        console.error(e.response?.errors?.[0]?.message || e);
+        console.error(errorMessage(e));
       }
 
       process.exit(1);

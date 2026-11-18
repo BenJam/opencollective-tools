@@ -40,17 +40,26 @@ node cloudflare_distribution/import.js "<csv>" --run --update-csv --delay 30
 
 Always do a dry run first and read the summary. Console output uses row ids (`R01`...) instead of names or emails.
 
-| Option                 | Meaning                                                                             |
-| ---------------------- | ----------------------------------------------------------------------------------- |
-| `--run`                | Create contributions and invites. Without it nothing is changed.                    |
-| `--yes`                | Skip the confirmation prompt (with `--run`).                                        |
-| `--update-csv`         | Write `<name>.with-links.csv` with a link in `Status` for each handled row.         |
-| `--delay <seconds>`    | Wait after each invite expense (default 20). Invites are rate limited by the API.   |
-| `--fund <slug>`        | Fund making the payments (default `vite-ecosystem-fund`).                           |
-| `--ledger <path>`      | Where completed rows are recorded (default `cloudflare_distribution/results.json`). |
-| `--description <text>` | Description used for invite expenses.                                               |
+| Option                    | Meaning                                                                                                         |
+| ------------------------- | --------------------------------------------------------------------------------------------------------------- |
+| `--run`                   | Create contributions and invites. Without it nothing is changed.                                                |
+| `--yes`                   | Skip the confirmation prompt (with `--run`).                                                                    |
+| `--update-csv`            | Write `<name>.with-links.csv` with a link in `Status` for each handled row.                                     |
+| `--delay <seconds>`       | Wait after each invite expense (default 20). Invites are rate limited by the API.                               |
+| `--retry-delay <seconds>` | First wait after a rate limit or network error (default 5), doubled on each retry. A `Retry-After` header wins. |
+| `--max-retries <n>`       | Retries of one call after a rate limit or network error before stopping (default 6).                            |
+| `--fund <slug>`           | Fund making the payments (default `vite-ecosystem-fund`).                                                       |
+| `--ledger <path>`         | Where completed rows are recorded (default `cloudflare_distribution/results.json`).                             |
+| `--description <text>`    | Description used for invite expenses.                                                                           |
 
-If the API rate limit is hit anyway, the script stops. Rows completed so far are saved, so just rerun later (or with a larger `--delay`).
+### Rate limits and network errors
+
+When the API rate limits a call (HTTP 429 or a "Rate limit exceeded" error) or the network fails, the script waits and sends the same call again. The wait is the `Retry-After` of the response when there is one, otherwise it starts at `--retry-delay` (5 seconds) and **doubles each time the same call fails again**: 5, 10, 20, 40, 80, 160 seconds (never more than 10 minutes). Each wait prints a line such as `Rate limited, waiting 10s before retry 2/6...`. Only rate limit and network errors are retried, other errors (validation, permissions, server errors) are reported right away.
+
+- **No duplicates.** A rate limited call is rejected before it does anything, so it is safe to send again. After a network error the call may still have gone through, so the script first looks on the Fund for the invite expense or contribution it was creating and uses it if it is there, instead of sending it again.
+- **When retries run out** (`--max-retries`), the script stops instead of guessing: no row is reported as `ambiguous` because of a rate limit or network problem. Rows completed so far are saved in `results.json`, so just rerun later.
+- The API allows about one invite per 10 seconds, which the default `--delay 20` stays under, so retries should be rare.
+- Error messages are redacted so the personal token never reaches the console.
 
 ## How rows are handled
 
