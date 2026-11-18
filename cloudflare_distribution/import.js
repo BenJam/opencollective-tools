@@ -245,6 +245,14 @@ const parseSlug = (url) => {
   }
 };
 
+// Selects which invite note a recipient gets, null when the column holds anything else
+const parseRecipientType = (record) => {
+  const value = String(record['Personal or Project?'] || '')
+    .trim()
+    .toLowerCase();
+  return ['personal', 'project'].includes(value) ? value : null;
+};
+
 const startOfCurrentMonth = () => {
   const now = new Date();
   return new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), 1)).toISOString();
@@ -313,8 +321,10 @@ async function fetchExistingActivity(fundSlug) {
   const expensesByKey = new Map();
   const expensesBySlug = new Map();
   const expenseCreatedAt = new Map();
+  const expenseStatus = new Map();
   for (const expense of expenses) {
     expenseCreatedAt.set(expense.legacyId, expense.createdAt);
+    expenseStatus.set(expense.legacyId, expense.status);
     // A refunded expense must not block sending it again
     if (refunded.has(`expense:${expense.legacyId}`)) {
       continue;
@@ -332,7 +342,7 @@ async function fetchExistingActivity(fundSlug) {
     }
   }
 
-  return { paidThisMonth, recurring, expensesByKey, expensesBySlug, expenseCreatedAt, refunded };
+  return { paidThisMonth, recurring, expensesByKey, expensesBySlug, expenseCreatedAt, expenseStatus, refunded };
 }
 
 const refFromLedger = (text) => {
@@ -391,7 +401,8 @@ function findInviteExpense(row, record, ledgerEntry, existing) {
     return null;
   }
   const createdAt = existing.expenseCreatedAt.get(Number(id)) || existing.expenseCreatedAt.get(id) || ledgerEntry?.at;
-  return { id, createdAt };
+  const status = existing.expenseStatus.get(Number(id)) || existing.expenseStatus.get(id);
+  return { id, createdAt, status };
 }
 
 const isNotFound = (err) =>
@@ -461,6 +472,7 @@ async function classify(record, index, { fundHostId, existing, ledger, sharedSlu
   const id = rowId(index);
   const row = { id, record, amountInCents: parseAmountInCents(record['Amounts']) };
   row.frequency = parseFrequency(record['monthly vs one-time']);
+  row.type = parseRecipientType(record);
   // One recipient can appear in several rows (e.g. monthly + one-time), so the key includes frequency and amount
   const key = (row.key = [normalizeKey(record['name']), row.frequency, row.amountInCents].join(':'));
 
@@ -513,31 +525,39 @@ async function classify(record, index, { fundHostId, existing, ledger, sharedSlu
     }
   }
   const resendable = (result) => (resend ? { ...result, resend: true, reason: `${resend}. ${result.reason}` } : result);
+  // Rows that send an invite need to know whether the recipient is a person or a project, to pick the note
+  const invitable = (result) =>
+    row.type
+      ? resendable(result)
+      : {
+          ...result,
+          bucket: 'ambiguous',
+          reason: `"Personal or Project?" must be Personal or Project, found "${(record['Personal or Project?'] || '').trim()}"`,
+        };
 
-  // Follow-up for monthly rows that were handled with an invite expense: once the recipient has an account that can
-  // receive balance contributions (the CSV was updated with it), set up the monthly contribution. Not in the same
-  // month as the invite, which already covers that month's payment.
+  // Monthly rows that were handled with an invite expense:
+  // - Invite from this month: nothing to do yet (it covers this month's payment).
+  // - Invite from an earlier month: send this month's invite, or start the monthly contribution once the recipient has an
+  //   account that can receive contributions. The newest one replaces the old one in the ledger and the CSV link. The old
+  //   expense itself is left as it is, including an unaccepted DRAFT.
   const invite = findInviteExpense(row, record, ledger[key], existing);
-  if (
-    !resend &&
-    row.frequency === 'MONTHLY' &&
-    invite &&
-    canReceiveFromFund(account, fundHostId) &&
-    !existing.recurring.has(slug)
-  ) {
+  if (!resend && row.frequency === 'MONTHLY' && invite) {
+    const receivable = canReceiveFromFund(account, fundHostId);
     if (!invite.createdAt || invite.createdAt >= startOfCurrentMonth()) {
-      return {
-        ...row,
-        bucket: 'already-done',
-        reason: `Invite expense #${invite.id} is from this month, monthly contribution can be set up from next month`,
-        existingRef: { type: 'expense', id: invite.id },
-      };
+      if (receivable && !existing.recurring.has(slug)) {
+        return {
+          ...row,
+          bucket: 'already-done',
+          reason: `Invite expense #${invite.id} is from this month, monthly contribution can be set up from next month`,
+          existingRef: { type: 'expense', id: invite.id },
+        };
+      }
+    } else if (!(receivable && existing.recurring.has(slug))) {
+      row.replaces = { id: invite.id, status: invite.status };
+      resend = `Monthly invite #${invite.id}${invite.status ? ` (${invite.status})` : ''} is from an earlier month, ${
+        receivable ? 'setting up the monthly contribution' : "sending this month's invite"
+      }, the old one is left untouched`;
     }
-    return {
-      ...row,
-      bucket: 'ready',
-      reason: `Invite expense #${invite.id} was sent earlier and the account can now receive contributions, setting up the monthly contribution`,
-    };
   }
 
   if (!resend && ledger[key]?.done) {
@@ -551,10 +571,11 @@ async function classify(record, index, { fundHostId, existing, ledger, sharedSlu
   // Slug-based checks are not reliable when several rows target the same account, those are flagged for a manual check.
   const useSlugChecks = slug && !sharedSlugs.has(slug);
   const duplicate = [
-    existing.expensesByKey.has(key) && [
-      `expense #${existing.expensesByKey.get(key)} already created for this row`,
-      { type: 'expense', id: existing.expensesByKey.get(key) },
-    ],
+    existing.expensesByKey.has(key) &&
+      String(existing.expensesByKey.get(key)) !== String(row.replaces?.id) && [
+        `expense #${existing.expensesByKey.get(key)} already created for this row`,
+        { type: 'expense', id: existing.expensesByKey.get(key) },
+      ],
     useSlugChecks &&
       existing.paidThisMonth.has(slug) && [`Fund already paid ${slug} this month`, existing.paidThisMonth.get(slug)],
     useSlugChecks &&
@@ -587,7 +608,7 @@ async function classify(record, index, { fundHostId, existing, ledger, sharedSlu
     if (!record['contact address']?.trim()) {
       return { ...row, bucket: 'ambiguous', reason: 'No Open Collective account and no contact address' };
     }
-    return resendable({ ...row, bucket: 'needs-invite', reason: 'No Open Collective account' });
+    return invitable({ ...row, bucket: 'needs-invite', reason: 'No Open Collective account' });
   }
   if (account.isArchived || account.isFrozen) {
     return { ...row, bucket: 'ambiguous', reason: `Account ${account.slug} is archived or frozen` };
@@ -597,7 +618,7 @@ async function classify(record, index, { fundHostId, existing, ledger, sharedSlu
     return resendable({ ...row, bucket: 'ready', reason: 'Same host, can contribute from the Fund balance' });
   }
   // Balance transfers only work inside one host, so everything else goes through an expense on the existing account
-  return resendable({
+  return invitable({
     ...row,
     bucket: 'existing-account-expense',
     reason: host
@@ -608,8 +629,10 @@ async function classify(record, index, { fundHostId, existing, ledger, sharedSlu
   });
 }
 
+const readNote = (filename) => fs.readFileSync(path.join(__dirname, filename), 'utf8').trim();
+
 const buildInviteExpense = (row, fund, { recipientNotes, description }) => {
-  const recipientNote = recipientNotes[row.frequency].replaceAll(
+  const recipientNote = recipientNotes[row.type][row.frequency].replaceAll(
     '{{amount}}',
     formatCents(row.amountInCents, fund.currency),
   );
@@ -665,7 +688,7 @@ const printSummary = (rows, fund) => {
     for (const row of bucketRows) {
       const amount = row.amountInCents ? formatCents(row.amountInCents, fund.currency) : '?';
       console.log(
-        `  ${row.id}  ${amount.padEnd(14)} ${(row.frequency || '?').padEnd(8)} ${row.slug || '-'}  ${row.reason}`,
+        `  ${row.id}  ${amount.padEnd(14)} ${(row.frequency || '?').padEnd(8)} ${(row.type || '?').padEnd(9)} ${row.slug || '-'}  ${row.reason}`,
       );
     }
   }
@@ -755,8 +778,14 @@ async function main(argv = process.argv) {
     const inviteOptions = {
       description: options.description,
       recipientNotes: {
-        ONETIME: fs.readFileSync(path.join(__dirname, 'invite-note.md'), 'utf8').trim(),
-        MONTHLY: fs.readFileSync(path.join(__dirname, 'invite-note-monthly.md'), 'utf8').trim(),
+        project: {
+          ONETIME: readNote('invite-note.md'),
+          MONTHLY: readNote('invite-note-monthly.md'),
+        },
+        personal: {
+          ONETIME: readNote('invite-note-personal.md'),
+          MONTHLY: readNote('invite-note-personal-monthly.md'),
+        },
       },
     };
     const delayMs = Number(options.delay) * 1000;

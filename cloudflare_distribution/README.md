@@ -25,6 +25,7 @@ Columns: `name, URLs, Amounts, monthly vs one-time, Personal or Project?, Donati
 - `Donation URL`: the recipient's opencollective.com page, if they have one (falls back to an opencollective.com link in `URLs`). Leave empty if they have no account.
 - `Amounts`: e.g. `$1,500`, in USD.
 - `monthly vs one-time`: `Monthly` or `One-off`.
+- `Personal or Project?`: `Personal` for an individual, `Project` for a project. It selects the invite note (see "Invite flow"). Rows that need an invite and have any other value (including `Fund` or blank) are reported as `ambiguous` until it is fixed. Rows that become contributions are not affected.
 - `contact address`: who the invite is sent to when the recipient has no account.
 - `Status`: `Sent` or a link, both mean the row has been handled (see below).
 
@@ -69,7 +70,15 @@ Notes:
 
 - **Balance contributions only work within one host**, which is why recipients on other hosts get an expense instead.
 - **An expense invite is a payout, not a contribution.** It appears in the Fund's expenses, not as a donation on the recipient's page.
-- **Invite flow.** The recipient gets an email, creates an account (or signs in), sets a payout method and submits. The amount and description are locked. Monthly recipients get a note explaining that the amount is meant to be sent monthly and asking them to create a Collective and share its URL (`invite-note-monthly.md`, other recipients get `invite-note.md`). Edit these files to change the wording, `{{amount}}` is filled in per row.
+- **Invite flow.** The recipient gets an email, creates an account (or signs in), sets a payout method and submits. The amount and description are locked. The note depends on `Personal or Project?` and the frequency, and `{{amount}}` is filled in per row. Edit the files to change the wording:
+
+  | Recipient | One-time                  | Monthly                                                                                      |
+  | --------- | ------------------------- | -------------------------------------------------------------------------------------------- |
+  | Project   | `invite-note.md`          | `invite-note-monthly.md`: asks them to create a Collective and share its URL                 |
+  | Personal  | `invite-note-personal.md` | `invite-note-personal-monthly.md`: this month's payment, a new invitation follows each month |
+
+  Individuals are not asked to create a Collective, they just accept the invitation. An individual cannot receive recurring contributions, so a monthly personal recipient gets a new invitation each month: rerun the script monthly (see Monthly re-runs).
+
 - **Same account in several rows** (for example a monthly and a one-time payment): each row is handled on its own, and the script warns that the "already paid" checks cannot tell them apart, so check the Fund's activity for that account by hand.
 - **Duplicate protection.** Besides `results.json`, the script asks the Open Collective API what the Fund has already paid this month, which monthly contributions are active and which expenses are open, and skips those recipients. Check that the rows you expect to be skipped show up in `already-contributed` or `already-done`.
 
@@ -84,11 +93,12 @@ Run the script again every month with the same command. A typical cycle:
 What happens to rows from earlier runs:
 
 - **One-time rows** that were paid or invited stay finished. They are never paid again, even in later months (this relies on `results.json`, or a link or `Sent` in `Status`).
-- **Monthly rows that went out as an invite** are followed up once the recipient has an account that can receive contributions from the Fund (same host as the Fund, active) and the CSV has its URL. The run then creates the **monthly contribution** and the row moves to `ready` with the reason "invite was sent earlier...". The follow-up is **never done in the same month as the invite**, since the invite already pays that month. Until then the row stays `already-done`.
+- **Monthly rows that went out as an invite** are renewed on the first run of each later month, as long as the recipient has no account that can receive contributions yet. The run sends a **new invite for the current month**, and the newest invite **replaces** the old one: the ledger (the old entry is kept under `history`) and the `Status` link point at the new one, but the old expense itself is **never deleted or cancelled** by the script, including one that was never accepted (still `DRAFT`). Clean up old drafts by hand if you want to, so the recipient is not left with several open invites. The same run is a no-op later in the same month. In the dry run these rows say "Monthly invite #N (STATUS) is from an earlier month, sending this month's invite, the old one is left untouched".
+- **Monthly rows whose recipient now has an account** that can receive contributions from the Fund (same host as the Fund, active) and whose URL is in the CSV get the **monthly contribution** instead of a new invite (the old invite is left untouched here too). This never happens in the same month as the invite, since the invite already pays that month. Once the monthly contribution is active the row is `already-done` or `already-contributed`.
 - **Monthly rows that were set up as a contribution** keep running by themselves. Open Collective charges them every month, nothing to rerun. They show up as `already-done` or `already-contributed`.
-- **Monthly recipients still on a different host** keep appearing as `already-done` after their first invite. Their next payments have to be sent some other way (a new invite, or move them to a host that can receive balance contributions).
+- **Monthly recipients on a different host, and individuals** cannot receive balance contributions, so they get a new invite every month this way, for as long as they stay in the CSV.
 
-Before a follow-up, check on the Fund's expenses page that the earlier invite expense was actually paid or cancelled. If it is still pending when the monthly contribution starts, the recipient could be paid twice for the first month.
+Before a follow-up that starts a monthly contribution, check on the Fund's expenses page that the earlier invite expense was paid or cancelled. Since the script leaves old invites alone, one that is still open (draft or pending) when the contribution starts could still be accepted and paid, so the recipient could be paid twice for that month.
 
 To redo a row that was handled by mistake, delete its entry from `results.json` (and clear its `Status` in the CSV), then rerun.
 
