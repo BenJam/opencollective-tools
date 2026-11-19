@@ -64,3 +64,20 @@ Check that the number of approved Expenses is the expected one and that there is
 5. Proceed Expense Payments with, enter your 2FA token when asked.
 
 `node 1kproject/pay-expenses.js --run`
+
+## Ecosystem Funds
+
+### Check ready to pay expenses against the GitHub Sponsors CSV
+
+Read-only check of the "ready to pay" expenses of https://opencollective.com/ecosystem-funds (and its child accounts) against the CSV used to pay maintainers through GitHub Sponsors. The CSV needs the columns `Maintainer username` and `Sponsorship amount in USD`.
+
+`API_URL=https://api.opencollective.com node ecosystem-funds/check-ready-to-pay.js payments.csv`
+
+Use `--account <slug>` to check another account. Expenses are matched to CSV rows on the GitHub username (taken from the GitHub link in the expense's payout method) and the amount (amounts are compared as whole dollars, rounded down), expenses are never summed, each one is paired with a CSV row of the same username and amount. The output lists:
+
+- Expenses ready to pay that are missing from the CSV
+- CSV rows that have no ready to pay expense
+- Amount mismatches
+- Expenses without a GitHub link in the payout method, and malformed CSV rows
+
+The exit code is 1 if there is any discrepancy.
