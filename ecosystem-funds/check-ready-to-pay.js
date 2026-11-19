@@ -180,6 +180,47 @@ const compare = (expenses, rows) => {
 
 const expenseUrl = (expense) => `https://opencollective.com/${expense.account}/expenses/${expense.legacyId}`;
 
+const csvField = (v) => {
+  const s = String(v ?? '');
+  return /[",\n\r]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
+};
+
+const REPORT_COLUMNS = [
+  'status',
+  'username',
+  'csv_amount_usd',
+  'csv_line',
+  'oc_amount',
+  'oc_currency',
+  'expense_id',
+  'expense_url',
+];
+
+/** One line per CSV row / expense, with its status, so the result can be sorted and filtered in a spreadsheet */
+const buildReportCsv = ({ matched, mismatched, missingFromCsv, missingOnOC, unmatchable, malformed }) => {
+  const line = (status, { expense, row, malformedRow } = {}) => ({
+    status,
+    username: expense?.username || row?.username || '',
+    csv_amount_usd: row ? row.cents / 100 : '',
+    csv_line: row?.line ?? malformedRow?.line ?? '',
+    oc_amount: expense ? expense.cents / 100 : '',
+    oc_currency: expense?.currency || '',
+    expense_id: expense?.legacyId || '',
+    expense_url: expense ? expenseUrl(expense) : '',
+  });
+  const lines = [
+    ...matched.map(({ expense, row }) => line('matched', { expense, row })),
+    ...mismatched.map(({ expense, row }) => line('amount_mismatch', { expense, row })),
+    ...missingFromCsv.map((expense) => line('missing_from_csv', { expense })),
+    ...missingOnOC.map((row) => line('missing_on_open_collective', { row })),
+    ...unmatchable.map((expense) => line('cannot_be_checked', { expense })),
+    ...malformed.map((malformedRow) => line(`malformed_csv_row: ${malformedRow.reason}`, { malformedRow })),
+  ];
+  return [REPORT_COLUMNS, ...lines.map((l) => REPORT_COLUMNS.map((c) => l[c]))]
+    .map((fields) => fields.map(csvField).join(','))
+    .join('\n');
+};
+
 const printSection = (title, items, format) => {
   console.log(`\n${title} (${items.length})`);
   if (items.length === 0) {
@@ -194,10 +235,10 @@ const getProgram = (argv) => {
   program
     .description('Check the ready to pay expenses of an account against a GitHub Sponsors payments CSV (read-only)')
     .argument('<csv>', "CSV with the columns 'Maintainer username' and 'Sponsorship amount in USD'")
+    .option('--account <slug>', 'Account whose ready to pay expenses (and its children) are checked', 'ecosystem-funds')
     .option(
-      '--account <slug>',
-      'Account whose ready to pay expenses (and its children) are checked',
-      'ecosystem-funds',
+      '--output <file>',
+      'Also write the results (one line per row or expense, with its status) to this CSV file',
     );
   program.parse(argv);
   return program;
@@ -206,7 +247,7 @@ const getProgram = (argv) => {
 async function main(argv = process.argv) {
   const program = getProgram(argv);
   const [csvPath] = program.args;
-  const { account } = program.opts();
+  const { account, output } = program.opts();
 
   const { rows, malformed } = parseCsv(fs.readFileSync(csvPath, 'utf8'));
   console.log(`Read ${rows.length} rows from the CSV`);
@@ -261,6 +302,12 @@ async function main(argv = process.argv) {
   console.log(`  Maintainers matched:      ${matched.length}`);
   console.log(`  Open Collective total:    ${formatCents(sum(expenses))} (${expenses.length} expenses)`);
   console.log(`  CSV total:                ${formatCents(sum(rows))} (${rows.length} rows)`);
+
+  if (output) {
+    const report = { matched, mismatched, missingFromCsv, missingOnOC, unmatchable, malformed };
+    fs.writeFileSync(output, `${buildReportCsv(report)}\n`);
+    console.log(`\nWrote the results to ${output}`);
+  }
 
   const problems =
     missingFromCsv.length + missingOnOC.length + mismatched.length + unmatchable.length + malformed.length;

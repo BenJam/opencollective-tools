@@ -73,7 +73,7 @@ Read-only check of the "ready to pay" expenses of https://opencollective.com/eco
 
 `API_URL=https://api.opencollective.com node ecosystem-funds/check-ready-to-pay.js payments.csv`
 
-Use `--account <slug>` to check another account. Expenses are matched to CSV rows on the GitHub username (taken from the GitHub link in the expense's payout method) and the amount (amounts are compared as whole dollars, rounded down), expenses are never summed, each one is paired with a CSV row of the same username and amount. The output lists:
+Use `--account <slug>` to check another account, and `--output <file.csv>` to also write the results to a CSV (one line per CSV row or expense with its status, columns: status, username, csv_amount_usd, csv_line, oc_amount, oc_currency, expense_id, expense_url). Expenses are matched to CSV rows on the GitHub username (taken from the GitHub link in the expense's payout method) and the amount (amounts are compared as whole dollars, rounded down), expenses are never summed, each one is paired with a CSV row of the same username and amount. The output lists:
 
 - Expenses ready to pay that are missing from the CSV
 - CSV rows that have no ready to pay expense
