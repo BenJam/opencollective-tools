@@ -249,6 +249,12 @@ async function main(argv = process.argv) {
     (e) => `${e.username || 'no GitHub link'}  ${e.cents / 100} ${e.currency}  ${expenseUrl(e)}`,
   );
   printSection('Malformed CSV rows', malformed, (m) => `line ${m.line}: ${m.reason}`);
+  printSection(
+    'MATCHED (CSV row and Open Collective expense)',
+    matched,
+    ({ expense, row }) =>
+      `${expense.username}  CSV $${row.cents / 100} (line ${row.line})  Open Collective ${formatCents(expense.cents)}  ${expenseUrl(expense)}`,
+  );
 
   const sum = (items) => items.reduce((total, item) => total + item.cents, 0);
   console.log('\nSummary');

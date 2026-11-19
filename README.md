@@ -79,5 +79,6 @@ Use `--account <slug>` to check another account. Expenses are matched to CSV row
 - CSV rows that have no ready to pay expense
 - Amount mismatches
 - Expenses without a GitHub link in the payout method, and malformed CSV rows
+- The matched CSV rows and expenses (CSV line, amounts and expense link), to validate them by hand
 
 The exit code is 1 if there is any discrepancy.
